@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=桌面整理
+Name[en]=Desktop Organizer
+Comment=桌面图标整理助手（腾讯桌面整理风格）
+Exec=/usr/local/bin/kylin-desktop-organizer
+Icon=preferences-desktop
+Terminal=false
+Categories=Utility;DesktopSettings;
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,23 @@
+[package]
+name = "kylin-desktop-organizer"
+version = "1.0.0"
+edition = "2021"
+description = "麒麟桌面整理助手 - 复刻腾讯桌面整理核心功能 (GTK3)"
+license = "MIT"
+
+[dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+glib = "0.18"
+gio = "0.18"
+gdk = "0.18"
+gdk-pixbuf = "0.18"
+cairo-rs = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = true
+strip = true
