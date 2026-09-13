@@ -1,0 +1,159 @@
+name: Release
+
+# 触发方式：
+#   1) 推送形如 v1.0.0 的 tag 时自动构建并发布
+#   2) 在 Actions 页面手动触发（workflow_dispatch），需填写 tag
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布标签，例如 v1.0.0（不存在时会基于当前提交创建）'
+        required: true
+        type: string
+
+# 创建 / 更新 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一 tag 的发布不并发执行，避免重复创建 Release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: kylin-desktop-organizer
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-release:
+    name: 构建并发布（Linux x86_64）
+    runs-on: ubuntu-22.04
+    # 在 Ubuntu 20.04 容器内构建：glibc 2.31 + GTK 3.24，
+    # 与银河麒麟 V10（Ubuntu 20.04 基础）目标环境一致，保证产物可直接运行。
+    container: ubuntu:20.04
+    timeout-minutes: 60
+
+    steps:
+      # 容器内 checkout 依赖 git，需在检出前预装
+      - name: 预装基础工具
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl
+
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 GTK3 构建依赖
+        run: |
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libgtk-3-dev libcairo2-dev libgdk-pixbuf2.0-dev libglib2.0-dev \
+            dpkg file
+
+      - name: 安装 Rust 工具链
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: 缓存 Cargo 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 编译 release
+        run: cargo build --release --locked
+
+      - name: 计算版本号
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="${REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: 打包产物（tar.gz + deb）
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          BIN="target/release/${APP_NAME}"
+          mkdir -p dist
+
+          # 1) 裸二进制，便于直接下载替换
+          cp "$BIN" "dist/${APP_NAME}"
+
+          # 2) tar.gz 归档（二进制 + 启动器 + 说明）
+          STAGE="$(mktemp -d)"
+          PKG_DIR="${STAGE}/${APP_NAME}-${VERSION}"
+          mkdir -p "$PKG_DIR"
+          cp "$BIN" "$PKG_DIR/"
+          cp "packaging/${APP_NAME}.desktop" "$PKG_DIR/"
+          cp README.md "$PKG_DIR/"
+          tar -C "$STAGE" -czf \
+            "dist/${APP_NAME}-${VERSION}-linux-x86_64.tar.gz" \
+            "${APP_NAME}-${VERSION}"
+
+          # 3) .deb 安装包（麒麟 V10 可直接 dpkg -i 安装）
+          DEB_ROOT="$(mktemp -d)"
+          install -Dm755 "$BIN" "${DEB_ROOT}/usr/bin/${APP_NAME}"
+          mkdir -p "${DEB_ROOT}/usr/share/applications"
+          sed "s#^Exec=.*#Exec=/usr/bin/${APP_NAME}#" \
+            "packaging/${APP_NAME}.desktop" \
+            > "${DEB_ROOT}/usr/share/applications/${APP_NAME}.desktop"
+          install -Dm644 README.md "${DEB_ROOT}/usr/share/doc/${APP_NAME}/README.md"
+          mkdir -p "${DEB_ROOT}/DEBIAN"
+          cat > "${DEB_ROOT}/DEBIAN/control" <<EOF
+          Package: ${APP_NAME}
+          Version: ${VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libgtk-3-0, libcairo2, libglib2.0-0, libgdk-pixbuf-2.0-0 | libgdk-pixbuf2.0-0
+          Maintainer: kylin-desktop-organizer
+          Description: 麒麟桌面整理助手
+           复刻腾讯桌面整理核心功能的国产桌面整理工具，
+           支持一键整理、盒子管理、图标吸附与状态持久化。
+          EOF
+          dpkg-deb --build --root-owner-group "${DEB_ROOT}" \
+            "dist/${APP_NAME}_${VERSION}_amd64.deb"
+
+          echo "==> 产物列表"
+          ls -lh dist
+
+      - name: 上传工作流产物（Artifacts）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.meta.outputs.version }}-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: 麒麟桌面整理助手 ${{ steps.meta.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
