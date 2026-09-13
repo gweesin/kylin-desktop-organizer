@@ -1,4 +1,4 @@
-//! 主题与样式：颜色 / 字号 / 盒子风格
+//! 主题与样式：颜色 / 字号 / 盒子风格（原 `theme.rs` 迁移）
 
 use gtk::gdk::RGBA;
 
@@ -40,9 +40,9 @@ impl Palette {
         }
     }
     pub fn get(theme: &str) -> Self {
-        match theme {
-            "dark" => Self::dark(),
-            _ => Self::light(),
+        match crate::core::config::Theme::parse(theme) {
+            crate::core::config::Theme::Dark => Self::dark(),
+            crate::core::config::Theme::Light => Self::light(),
         }
     }
 }

@@ -1,4 +1,4 @@
-//! 桌面应用启动 / 文件打开
+//! 文件 / 应用打开与删除等平台操作（原 `launch.rs` 原样迁移）
 
 use gio::prelude::*;
 use std::process::Command;
@@ -42,6 +42,7 @@ pub fn delete_file(path: &str) -> bool {
     true
 }
 
+/// 是否可安全删除的空目录
 pub fn is_removable_dir(path: &str) -> bool {
     let p = std::path::Path::new(path);
     if let Ok(md) = p.metadata() {
@@ -55,4 +56,42 @@ pub fn is_removable_dir(path: &str) -> bool {
             .unwrap_or(false);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn executable_and_desktop_detection() {
+        assert!(is_executable("run.sh"));
+        assert!(is_executable("install.run"));
+        assert!(is_executable("foo.AppImage"));
+        assert!(is_executable("app.desktop"));
+        assert!(!is_executable("notes.txt"));
+        assert!(!is_executable(""));
+        assert!(is_desktop_file("/x/y.desktop"));
+        assert!(!is_desktop_file("/x/y.txt"));
+    }
+
+    #[test]
+    fn removable_dir_only_for_empty_dir() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("empty");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(is_removable_dir(sub.to_str().unwrap()));
+
+        let busy = dir.path().join("busy");
+        std::fs::create_dir(&busy).unwrap();
+        std::fs::write(busy.join("f.txt"), "x").unwrap();
+        assert!(!is_removable_dir(busy.to_str().unwrap()));
+
+        // 文件不是目录
+        assert!(!is_removable_dir(
+            dir.path().join("f.txt").to_str().unwrap()
+        ));
+        // 不存在的路径
+        assert!(!is_removable_dir(dir.path().join("nope").to_str().unwrap()));
+    }
 }

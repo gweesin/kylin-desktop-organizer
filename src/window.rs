@@ -1,18 +1,31 @@
-//! 桌面层主窗口：透明 ARGB 桌面窗口 + 图标 + 盒子 + 拖拽 + 动画 + 右键菜单
+//! 应用编排层：桌面层主窗口 + 图标/盒子生命周期 + 事件分发
+//!
+//! 重构说明：原 `window.rs`（1500 行）把控件、算法、菜单、持久化全部耦合在一起。
+//! 重构后仅保留「窗口与事件编排」职责：
+//! - 布局/整理算法 → `core::layout` / `core::organize`（纯函数）
+//! - 盒子控件 → `ui::box_view`
+//! - 右键菜单 → `ui::menu`
+//! - 设置面板 → `ui::settings`；持久化 → `core::config_store`
 
-use crate::categorize;
-use crate::icon::{short_name, DesktopIcon, IconKind};
-use crate::icons_util;
-use crate::launch;
-use crate::model::{BoxState, Config, IconState};
-use crate::settings::SettingsDlg;
-use crate::theme::Palette;
+use crate::core::categorize;
+use crate::core::config::{BoxState, Config, IconState};
+use crate::core::config_store::ConfigStore;
+use crate::core::layout;
+use crate::core::organize;
+use crate::infra::launch;
+use crate::ui::box_view::BoxView;
+use crate::ui::desktop_icon::{short_name, DesktopIcon, IconKind};
+use crate::ui::icon_surface;
+use crate::ui::menu;
+use crate::ui::settings::SettingsDlg;
+use crate::ui::theme::Palette;
 use gtk::prelude::*;
 use gtk::{gdk, Fixed, Inhibit, Window, WindowType};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+
 pub const BOX_PADDING: i32 = 8;
 pub const BOX_TITLE_H: i32 = 34;
 pub const BOX_MIN_W: i32 = 96;
@@ -26,6 +39,7 @@ pub struct DesktopWindow {
     pub fixed: Fixed,
     pub cfg: Rc<RefCell<Config>>,
     pub pal: Rc<RefCell<Palette>>,
+    pub store: ConfigStore,
     pub icons: Rc<RefCell<HashMap<String, Rc<DesktopIcon>>>>,
     pub boxes: Rc<RefCell<HashMap<String, Rc<RefCell<BoxView>>>>>,
     pub desktop_rect: (i32, i32, i32, i32),
@@ -38,38 +52,8 @@ pub struct DesktopWindow {
     pub dragging: Rc<RefCell<Option<String>>>,
 }
 
-pub struct BoxView {
-    pub id: String,
-    pub title: String,
-    pub event: gtk::EventBox,
-    pub header: gtk::EventBox,
-    pub title_label: gtk::Label,
-    pub content: Fixed,
-    pub collapse_btn: gtk::Button,
-    pub close_btn: gtk::Button,
-    pub color_dot: gtk::DrawingArea,
-    pub fixed: Fixed,
-    pub collapsed: bool,
-    pub minimized: bool,
-    pub drag_start: (f64, f64),
-    pub icons: Vec<String>,
-    pub hover_close: bool,
-    pub hover_btn: bool,
-    pub target_w: i32,
-    pub target_h: i32,
-    pub resize_from: Option<(i32, i32)>,
-    pub pos: (i32, i32),
-}
-
-impl BoxView {
-    pub fn size(&self) -> (i32, i32) {
-        let alloc = self.event.allocation();
-        (alloc.width(), alloc.height())
-    }
-}
-
 impl DesktopWindow {
-    pub fn new(cfg: Config) -> Rc<Self> {
+    pub fn new(cfg: Config, store: ConfigStore) -> Rc<Self> {
         let win = Window::new(WindowType::Toplevel);
         win.set_title("桌面整理");
         win.set_type_hint(gdk::WindowTypeHint::Desktop);
@@ -119,6 +103,7 @@ impl DesktopWindow {
             fixed: fixed.clone(),
             cfg: cfg.clone(),
             pal: pal.clone(),
+            store,
             icons,
             boxes,
             desktop_rect,
@@ -132,13 +117,13 @@ impl DesktopWindow {
         });
 
         // 桌面空白右键菜单
-        let menu = this.build_desktop_menu();
+        let menu = menu::build_desktop_menu(&this);
         {
             let this = this.clone();
             let menu = menu.clone();
             win.connect_button_press_event(move |_w, ev| {
                 if ev.button() == 3 {
-                    this.desktop_menu_popup(&menu, ev);
+                    menu::popup(&menu, ev);
                     return Inhibit(true);
                 }
                 Inhibit(false)
@@ -148,7 +133,6 @@ impl DesktopWindow {
         {
             let this = this.clone();
             let blank_click = Rc::new(RefCell::new((0u64, 0i32, 0i32)));
-            let blank_click2 = blank_click.clone();
             win.connect_button_press_event(move |_w, ev| {
                 if ev.button() == 1 {
                     this.clear_selection();
@@ -180,7 +164,7 @@ impl DesktopWindow {
                 this.organize_icons(true);
             }
             cfg.borrow_mut().first_run = false;
-            crate::model::save_config(&cfg.borrow());
+            this.persist();
         }
 
         win.show_all();
@@ -207,7 +191,7 @@ impl DesktopWindow {
 
     // ---------------- 扫描桌面 ----------------
 
-    pub fn scan_desktop(&self, only_missing: bool) -> usize {
+    pub fn scan_desktop(&self, _only_missing: bool) -> usize {
         let home = dirs::desktop_dir().unwrap_or_else(|| {
             dirs::home_dir()
                 .map(|h| h.join("Desktop"))
@@ -218,12 +202,7 @@ impl DesktopWindow {
         };
         let gap = self.cfg.borrow().grid_gap;
         let size = self.cfg.borrow().icon_size;
-        let total = icons_util::icon_total(size);
-        let cell = total + gap;
-
-        let mut row = 0;
-        let mut col = 0;
-        let max_per_row = ((self.desktop_rect.2 - 80) / cell).max(1) as i32;
+        let max_per_row = layout::max_per_row(self.desktop_rect.2 - 80, size, gap);
 
         let entries: Vec<_> = rd.flatten().collect();
         let mut new_items: Vec<(String, bool)> = vec![];
@@ -247,18 +226,17 @@ impl DesktopWindow {
         new_items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         let mut added = 0;
-        for (path, _is_dir) in new_items {
-            let x = 20 + col * cell;
-            let y = 16 + row * (total + 30);
-            if let Some(ic) = self.make_icon(&path, IconKind::Desktop, size) {
+        for (idx, (path, _is_dir)) in new_items.iter().enumerate() {
+            let (x, y) = layout::desktop_pos(
+                (idx as i32) % max_per_row,
+                (idx as i32) / max_per_row,
+                size,
+                gap,
+            );
+            if let Some(ic) = self.make_icon(path, IconKind::Desktop, size) {
                 self.add_icon(&ic, x, y);
                 self.icons.borrow_mut().insert(path.clone(), ic);
                 added += 1;
-            }
-            col += 1;
-            if col >= max_per_row {
-                col = 0;
-                row += 1;
             }
         }
         if added > 0 {
@@ -309,12 +287,11 @@ impl DesktopWindow {
         }
         {
             let this = self.clone();
-            let ic = ic.clone();
             let path = path.to_string();
-            ic.widget.connect_button_press_event(move |w, ev| {
+            ic.widget.connect_button_press_event(move |_w, ev| {
                 if ev.button() == 3 {
                     this.select_icon(&path);
-                    let menu = this.build_icon_menu(&path, &ic);
+                    let menu = menu::build_icon_menu(&this, &path);
                     menu.popup_at_pointer(Some(ev));
                     return Inhibit(true);
                 }
@@ -323,7 +300,6 @@ impl DesktopWindow {
         }
         {
             let this = self.clone();
-            let ic = ic.clone();
             let path = path.to_string();
             ic.widget.connect_motion_notify_event(move |_w, ev| {
                 this.icon_motion(&path, ev);
@@ -347,7 +323,7 @@ impl DesktopWindow {
 
     pub fn add_icon(&self, ic: &Rc<DesktopIcon>, x: i32, y: i32) {
         self.fixed.put(ic.widget.clone(), x, y);
-        let w = icons_util::icon_total(self.cfg.borrow().icon_size) + 4;
+        let w = layout::icon_total(self.cfg.borrow().icon_size) + 4;
         self.fixed
             .child_set_property(ic.widget.clone(), "width-request", &w);
     }
@@ -417,19 +393,17 @@ impl DesktopWindow {
     /// 图标吸附网格（水平对齐）
     pub fn snap_icon(&self, ic: &Rc<DesktopIcon>) {
         let gap = self.cfg.borrow().grid_gap;
-        let total = icons_util::icon_total(self.cfg.borrow().icon_size);
-        let cell = total + gap;
-        let (x, y) = ic.position(&self.fixed);
-        let nx = ((x as f64 / cell as f64).round() as i32) * cell;
-        let ny = y;
-        if (nx - x).abs() < SNAP + gap / 2 {
-            self.fixed.move_(ic.widget.clone(), nx, ny);
+        let size = self.cfg.borrow().icon_size;
+        let (x, _y) = ic.position(&self.fixed);
+        if let Some(nx) = layout::snap_x(x, size, gap, SNAP) {
+            let (_, y) = ic.position(&self.fixed);
+            self.fixed.move_(ic.widget.clone(), nx, y);
         }
     }
 
     fn box_containing(&self, ic: &Rc<DesktopIcon>) -> Option<String> {
         let (x, y) = ic.position(&self.fixed);
-        let total = icons_util::icon_total(self.cfg.borrow().icon_size);
+        let total = layout::icon_total(self.cfg.borrow().icon_size);
         let cx = x + total / 2;
         let cy = y + total / 2;
         for (id, b) in self.boxes.borrow().iter() {
@@ -439,7 +413,7 @@ impl DesktopWindow {
             }
             let (bx, by) = b.pos;
             let (bw, bh) = b.size();
-            if cx >= bx && cx <= bx + bw && cy >= by && cy <= by + bh {
+            if layout::point_in_rect(cx, cy, bx, by, bw, bh) {
                 return Some(id.clone());
             }
         }
@@ -451,7 +425,7 @@ impl DesktopWindow {
         let Some(ic) = self.icons.borrow().get(path).cloned() else {
             return;
         };
-        let mut box_ = self.boxes.borrow().get(box_id).cloned();
+        let box_ = self.boxes.borrow().get(box_id).cloned();
         let Some(bv) = box_ else { return };
         // 若在别的盒子里，先移除
         let other: Vec<String> = self
@@ -477,79 +451,13 @@ impl DesktopWindow {
     // ---------------- 盒子创建 ----------------
 
     pub fn create_box(&self, bs: &BoxState) {
-        let event = gtk::EventBox::new();
-        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        event.add(&vbox);
-
-        // 标题栏
-        let header = gtk::EventBox::new();
-        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        hbox.set_margin_start(10);
-        hbox.set_margin_end(6);
-        hbox.set_margin_top(4);
-        hbox.set_margin_bottom(4);
-        header.add(&hbox);
-
-        let color_dot = gtk::DrawingArea::new();
-        color_dot.set_size_request(10, 10);
-
-        let title_label = gtk::Label::new(Some(&bs.title));
-        title_label.set_xalign(0.0);
-        title_label.set_selectable(false);
-
-        // 折叠按钮
-        let collapse_btn = gtk::Button::new_with_label("─");
-        collapse_btn.set_relief(gtk::ReliefStyle::None);
-        collapse_btn.set_focus_on_click(false);
-        collapse_btn.set_size_request(22, 22);
-        // 关闭按钮
-        let close_btn = gtk::Button::new_with_label("✕");
-        close_btn.set_relief(gtk::ReliefStyle::None);
-        close_btn.set_focus_on_click(false);
-        close_btn.set_size_request(22, 22);
-
-        hbox.pack_start(&color_dot, false, false, 0);
-        hbox.pack_start(&title_label, true, true, 0);
-        hbox.pack_start(&collapse_btn, false, false, 0);
-        hbox.pack_start(&close_btn, false, false, 0);
-
-        let content = Fixed::new();
-
-        vbox.pack_start(&header, false, false, 0);
-        vbox.pack_start(&content, true, true, 0);
-
-        event.add(&vbox);
-        event.set_above_child(true);
-        event.set_visible_window(true);
-        event.set_app_paintable(true);
-
-        let bv = Rc::new(RefCell::new(BoxView {
-            id: bs.id.clone(),
-            title: bs.title.clone(),
-            event: event.clone(),
-            header: header.clone(),
-            title_label: title_label.clone(),
-            content: content.clone(),
-            collapse_btn: collapse_btn.clone(),
-            close_btn: close_btn.clone(),
-            color_dot: color_dot.clone(),
-            fixed: self.fixed.clone(),
-            collapsed: bs.collapsed,
-            minimized: false,
-            drag_start: (0.0, 0.0),
-            icons: bs.icons.iter().map(|i| i.path.clone()).collect(),
-            hover_close: false,
-            hover_btn: false,
-            target_w: bs.w,
-            target_h: bs.h,
-            resize_from: None,
-            pos: (bs.x, bs.y),
-        }));
+        let bv = BoxView::build(bs, self.fixed.clone());
 
         // 绘制盒子外观
         {
             let pal = self.pal.clone();
             let opacity = self.cfg.borrow().box_opacity;
+            let event = bv.borrow().event.clone();
             event.connect_draw(move |w, cr| {
                 let alloc = w.allocation();
                 let (w_, h_) = (alloc.width() as f64, alloc.height() as f64);
@@ -557,12 +465,12 @@ impl DesktopWindow {
                 // 半透明背景
                 let (r, g, b) = p.box_bg;
                 cr.set_source_rgba(r, g, b, opacity);
-                icons_util::round_rect(cr, 1.0, 1.0, w_ - 2.0, h_ - 2.0, 10.0);
+                icon_surface::round_rect(cr, 1.0, 1.0, w_ - 2.0, h_ - 2.0, 10.0);
                 cr.fill();
                 // 边框
                 let (br, bg, bb) = p.box_border;
                 cr.set_source_rgba(br, bg, bb, 0.9);
-                icons_util::round_rect(cr, 1.0, 1.0, w_ - 2.0, h_ - 2.0, 10.0);
+                icon_surface::round_rect(cr, 1.0, 1.0, w_ - 2.0, h_ - 2.0, 10.0);
                 cr.set_line_width(1.2);
                 cr.stroke();
                 glib::Propagation::Proceed
@@ -573,6 +481,7 @@ impl DesktopWindow {
         {
             let this = self.clone();
             let bv = bv.clone();
+            let header = bv.borrow().header.clone();
             header.connect_button_press_event(move |_w, ev| {
                 if ev.button() == 1 {
                     bv.borrow_mut().drag_start = (ev.x(), ev.y());
@@ -596,6 +505,7 @@ impl DesktopWindow {
         {
             let this = self.clone();
             let bv = bv.clone();
+            let close_btn = bv.borrow().close_btn.clone();
             close_btn.connect_clicked(move |_b| {
                 this.close_box(&bv);
             });
@@ -604,6 +514,7 @@ impl DesktopWindow {
         {
             let this = self.clone();
             let bv = bv.clone();
+            let collapse_btn = bv.borrow().collapse_btn.clone();
             collapse_btn.connect_clicked(move |_b| {
                 this.toggle_collapse(&bv);
             });
@@ -613,9 +524,10 @@ impl DesktopWindow {
         {
             let this = self.clone();
             let bv = bv.clone();
+            let header = bv.borrow().header.clone();
             header.connect_button_press_event(move |_w, ev| {
                 if ev.button() == 3 {
-                    let menu = this.build_box_menu(&bv);
+                    let menu = menu::build_box_menu(&this, &bv);
                     menu.popup_at_pointer(Some(ev));
                     return Inhibit(true);
                 }
@@ -624,9 +536,9 @@ impl DesktopWindow {
         }
 
         // 加入容器
-        self.fixed.put(event.clone(), bs.x, bs.y);
+        self.fixed.put(bv.borrow().event.clone(), bs.x, bs.y);
         let (tw, th) = (bs.w.max(BOX_MIN_W), bs.h.max(BOX_MIN_H));
-        event.set_size_request(tw, th);
+        bv.borrow().event.set_size_request(tw, th);
 
         // 恢复盒子内图标
         for st in &bs.icons {
@@ -634,7 +546,7 @@ impl DesktopWindow {
             if let Some(ic) = self.make_icon(&st.path, IconKind::Box, size) {
                 let (ix, iy) = (st.x, st.y);
                 bv.borrow().content.put(ic.widget.clone(), ix, iy);
-                let w = icons_util::icon_total(size) + 4;
+                let w = layout::icon_total(size) + 4;
                 bv.borrow()
                     .content
                     .child_set_property(ic.widget.clone(), "width-request", &w);
@@ -646,7 +558,7 @@ impl DesktopWindow {
         // 若折叠，应用折叠高度
         if bs.collapsed {
             let h = BOX_TITLE_H + 4;
-            event.set_size_request(tw, h);
+            bv.borrow().event.set_size_request(tw, h);
         }
 
         self.boxes.borrow_mut().insert(bs.id.clone(), bv);
@@ -711,28 +623,18 @@ impl DesktopWindow {
     pub fn reflow_box(&self, bv: &Rc<RefCell<BoxView>>) {
         let size = self.cfg.borrow().icon_size;
         let gap = self.cfg.borrow().grid_gap;
-        let total = icons_util::icon_total(size);
-        let cell = total + gap;
-        let max_per_row = (((bv.borrow().size().0 - BOX_PADDING * 2) / cell).max(1)) as i32;
+        let avail_w = bv.borrow().size().0 - BOX_PADDING * 2;
+        let mpr = layout::max_per_row(avail_w, size, gap);
 
         let paths: Vec<String> = bv.borrow().icons.clone();
-        let mut col = 0;
-        let mut row = 0;
-        for p in &paths {
+        for (i, p) in paths.iter().enumerate() {
             if let Some(ic) = self.icons.borrow().get(p).cloned() {
-                let x = BOX_PADDING + col * cell;
-                let y = BOX_PADDING + row * (total + 30);
+                let (x, y) = layout::box_icon_pos(i as i32, mpr, size, gap, BOX_PADDING);
                 bv.borrow().content.move_(ic.widget.clone(), x, y);
-            }
-            col += 1;
-            if col >= max_per_row {
-                col = 0;
-                row += 1;
             }
         }
         // 自适应高度
-        let rows = if paths.is_empty() { 1 } else { row + 1 };
-        let need_h = BOX_TITLE_H + BOX_PADDING * 2 + rows * (total + 30) + 4;
+        let need_h = layout::box_height(paths.len(), mpr, size, BOX_TITLE_H, BOX_PADDING);
         if need_h > bv.borrow().target_h {
             bv.borrow_mut().target_h = need_h;
             if !bv.borrow().collapsed {
@@ -747,8 +649,6 @@ impl DesktopWindow {
     pub fn organize_icons(&self, animate: bool) {
         let gap = self.cfg.borrow().grid_gap;
         let size = self.cfg.borrow().icon_size;
-        let total = icons_util::icon_total(size);
-        let cell = total + gap;
 
         // 清空现有盒子布局：所有图标先回桌面层（保留盒子本体）
         let box_ids: Vec<String> = self.boxes.borrow().keys().cloned().collect();
@@ -773,74 +673,38 @@ impl DesktopWindow {
         // 重新扫描桌面，保证拿到最新文件
         self.scan_desktop(true);
 
-        // 分组
+        // 分组与布局规划（纯算法）
         let show_files = self.cfg.borrow().show_files;
-        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         let paths: Vec<String> = self.icons.borrow().keys().cloned().collect();
-        for p in &paths {
-            // 关闭"显示文件"时，文件/图片/压缩包类图标直接隐藏，不参与整理
-            if !show_files {
-                let cat = categorize::classify_desktop_item(
-                    Path::new(p)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(""),
-                    Path::new(p),
-                );
-                if matches!(cat.as_str(), "文件" | "图片视频" | "压缩包" | "文件夹") {
-                    continue;
-                }
-            }
-            let cat = categorize::classify_desktop_item(
-                Path::new(p)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(""),
-                Path::new(p),
-            );
-            groups.entry(cat).or_default().push(p.clone());
-        }
-
-        // 忽略空的"文件夹/其他"组
-        groups.retain(|k, v| !(categorize::is_empty_folder(k) && v.is_empty()));
-        // 排序组
-        let mut order: Vec<(String, Vec<String>)> = groups.into_iter().collect();
-        order.sort_by(|a, b| {
-            let ai = categorize::CATEGORY_ORDER
-                .iter()
-                .position(|c| *c == a.0)
-                .unwrap_or(usize::MAX);
-            let bi = categorize::CATEGORY_ORDER
-                .iter()
-                .position(|c| *c == b.0)
-                .unwrap_or(usize::MAX);
-            ai.cmp(&bi)
+        let groups = organize::build_groups(&paths, show_files, |p| {
+            let name = Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            categorize::classify_desktop_item(name, Path::new(p))
         });
-
-        let max_per_row = ((self.desktop_rect.2 - 80) / cell).max(2) as i32;
-        let mut x = 20;
-        let mut y = 16;
+        let plan = organize::plan_organize(
+            &groups,
+            self.desktop_rect.2,
+            size,
+            gap,
+            BOX_TITLE_H,
+            BOX_PADDING,
+        );
+        let mpr = organize::organize_max_per_row(self.desktop_rect.2, size, gap);
 
         let box_ids: Vec<String> = self.boxes.borrow().keys().cloned().collect();
         let mut used_box = 0;
 
-        for (cat, items) in &order {
-            if items.is_empty() {
-                continue;
-            }
-            // 每类建一个盒子
-            let n = items.len();
-            let cols = n.min(max_per_row as usize);
-            let rows = (n as f64 / max_per_row as f64).ceil().max(1.0) as i32;
-            let bw = cols as i32 * cell + BOX_PADDING * 2;
-            let bh = BOX_TITLE_H + BOX_PADDING * 2 + rows * (total + 30) + 4;
+        for cp in &plan.boxes {
+            let (x, y, bw, bh) = (cp.x, cp.y, cp.w, cp.h);
 
             let (bid, bv) = if used_box < box_ids.len() {
                 // 复用旧盒子（按顺序）
                 let id = box_ids[used_box].clone();
                 let b = self.boxes.borrow().get(&id).cloned().unwrap();
-                b.borrow_mut().title = cat.clone();
-                b.borrow_mut().title_label.set_text(cat);
+                b.borrow_mut().title = cp.title.clone();
+                b.borrow_mut().title_label.set_text(&cp.title);
                 b.borrow_mut().target_w = bw;
                 b.borrow_mut().target_h = bh;
                 b.borrow_mut().collapsed = false;
@@ -857,7 +721,7 @@ impl DesktopWindow {
                 let id = format!("auto-{seq}");
                 let bs = BoxState {
                     id: id.clone(),
-                    title: cat.clone(),
+                    title: cp.title.clone(),
                     x,
                     y,
                     w: bw,
@@ -877,21 +741,13 @@ impl DesktopWindow {
             bv.borrow_mut().pos = (x, y);
 
             // 把图标加入盒子
-            let mut col = 0;
-            let mut r = 0;
-            for p in items {
+            for (i, p) in cp.icons.iter().enumerate() {
                 let ic = self.icons.borrow().get(p).cloned().unwrap();
                 // 从桌面层移除，加入盒子
                 self.fixed.remove(&ic.widget.clone());
-                let ix = BOX_PADDING + col * cell;
-                let iy = BOX_PADDING + r * (total + 30);
+                let (ix, iy) = layout::box_icon_pos(i as i32, mpr, size, gap, BOX_PADDING);
                 bv.borrow().content.put(ic.widget.clone(), ix, iy);
                 bv.borrow_mut().icons.push(p.clone());
-                col += 1;
-                if col >= max_per_row as usize {
-                    col = 0;
-                    r += 1;
-                }
             }
 
             // 动画：盒子与图标飞入（简化：盒子位置动画）
@@ -908,12 +764,6 @@ impl DesktopWindow {
                     glib::ControlFlow::Break
                 });
             }
-
-            x += bw + 16;
-            if x + bw > self.desktop_rect.2 - 40 {
-                x = 20;
-                y += bh + 20;
-            }
         }
 
         // 多余的旧盒子删除
@@ -927,10 +777,6 @@ impl DesktopWindow {
 
         *self.organized.borrow_mut() = true;
         self.persist();
-    }
-
-    fn is_special(&self, cat: &str) -> bool {
-        cat == "我的电脑" || cat == "回收站"
     }
 
     fn animate_box(
@@ -958,68 +804,13 @@ impl DesktopWindow {
         });
     }
 
-    // ---------------- 事件：双击 / 菜单 ----------------
+    // ---------------- 事件：双击 ----------------
 
     fn double_click(&self, path: &str, _ic: &Rc<DesktopIcon>) {
         if !*self.draggable.borrow() {
             return;
         }
         launch::open_path(path);
-    }
-
-    fn build_desktop_menu(&self) -> gtk::Menu {
-        let menu = gtk::Menu::new();
-        let this = self.clone();
-
-        let it = gtk::MenuItem::with_label("一键整理");
-        {
-            let this = this.clone();
-            it.connect_activate(move |_| this.organize_icons(true));
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("新建盒子");
-        {
-            let this = this.clone();
-            it.connect_activate(move |_| this.new_box("新建盒子"));
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("扫描桌面");
-        {
-            let this = this.clone();
-            it.connect_activate(move |_| {
-                let n = this.scan_desktop(false);
-                this.notify(&format!("已添加 {n} 个桌面图标"));
-            });
-        }
-        menu.append(&it);
-
-        menu.append(&gtk::SeparatorMenuItem::new());
-
-        let it = gtk::MenuItem::with_label("设置");
-        {
-            let this = this.clone();
-            it.connect_activate(move |_| this.open_settings());
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("退出");
-        {
-            let this = this.clone();
-            it.connect_activate(move |_| {
-                this.persist();
-                gtk::main_quit();
-            });
-        }
-        menu.append(&it);
-
-        menu.show_all();
-        menu
-    }
-
-    fn desktop_menu_popup(&self, menu: &gtk::Menu, ev: &gdk::EventButton) {
-        menu.popup_at_pointer(Some(ev));
     }
 
     pub fn new_box(&self, title: &str) {
@@ -1046,119 +837,9 @@ impl DesktopWindow {
         let _ = id;
     }
 
-    // ---------------- 菜单：图标 / 盒子 ----------------
-
-    fn build_icon_menu(&self, path: &str, _ic: &Rc<DesktopIcon>) -> gtk::Menu {
-        let menu = gtk::Menu::new();
-        let this = self.clone();
-        let path = path.to_string();
-
-        let it = gtk::MenuItem::with_label("打开");
-        {
-            let p = path.clone();
-            it.connect_activate(move |_| launch::open_path(&p));
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("在文件管理器中显示");
-        {
-            let p = path.clone();
-            it.connect_activate(move |_| launch::show_in_file_manager(&p));
-        }
-        menu.append(&it);
-
-        menu.append(&gtk::SeparatorMenuItem::new());
-
-        // 移入盒子子菜单
-        let sub = gtk::Menu::new();
-        let box_ids: Vec<String> = self.boxes.borrow().keys().cloned().collect();
-        if box_ids.is_empty() {
-            let it = gtk::MenuItem::with_label("(暂无盒子)");
-            it.set_sensitive(false);
-            sub.append(&it);
-        } else {
-            for id in &box_ids {
-                let it =
-                    gtk::MenuItem::with_label(&self.boxes.borrow().get(id).unwrap().borrow().title);
-                let bid = id.clone();
-                let p = path.clone();
-                it.connect_activate(move |_| this.add_icon_to_box(&bid, &p));
-                sub.append(&it);
-            }
-        }
-        let mi = gtk::MenuItem::with_label("移入盒子");
-        mi.set_submenu(Some(&sub));
-        menu.append(&mi);
-
-        let it = gtk::MenuItem::with_label("重命名");
-        {
-            let this = this.clone();
-            let p = path.clone();
-            it.connect_activate(move |_| this.rename_icon(&p));
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("复制");
-        {
-            let p = path.clone();
-            it.connect_activate(move |_| this.copy_icon(&p));
-        }
-        menu.append(&it);
-
-        menu.append(&gtk::SeparatorMenuItem::new());
-
-        let it = gtk::MenuItem::with_label("删除");
-        {
-            let p = path.clone();
-            it.connect_activate(move |_| this.delete_icon(&p));
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("属性");
-        {
-            let p = path.clone();
-            it.connect_activate(move |_| this.icon_properties(&p));
-        }
-        menu.append(&it);
-
-        menu.show_all();
-        menu
-    }
-
-    fn build_box_menu(&self, bv: &Rc<RefCell<BoxView>>) -> gtk::Menu {
-        let menu = gtk::Menu::new();
-        let this = self.clone();
-
-        let it = gtk::MenuItem::with_label("重命名盒子");
-        {
-            let bv = bv.clone();
-            it.connect_activate(move |_| this.rename_box(&bv));
-        }
-        menu.append(&it);
-
-        let it = gtk::MenuItem::with_label("添加盒子");
-        {
-            let this = this.clone();
-            it.connect_activate(move |_| this.new_box("新建盒子"));
-        }
-        menu.append(&it);
-
-        menu.append(&gtk::SeparatorMenuItem::new());
-
-        let it = gtk::MenuItem::with_label("移除盒子");
-        {
-            let bv = bv.clone();
-            it.connect_activate(move |_| this.close_box(&bv));
-        }
-        menu.append(&it);
-
-        menu.show_all();
-        menu
-    }
-
     // ---------------- 图标操作 ----------------
 
-    fn rename_icon(&self, path: &str) {
+    pub(crate) fn rename_icon(&self, path: &str) {
         let old = path.to_string();
         let dir = Path::new(&old).parent().map(|p| p.to_path_buf());
         let old_name = Path::new(&old)
@@ -1192,7 +873,7 @@ impl DesktopWindow {
         }
     }
 
-    fn copy_icon(&self, path: &str) {
+    pub(crate) fn copy_icon(&self, path: &str) {
         let gio_f = gio::File::for_path(path);
         let dest = format!("{path}.copy");
         let dest_f = gio::File::for_path(&dest);
@@ -1205,7 +886,7 @@ impl DesktopWindow {
         self.scan_desktop(false);
     }
 
-    fn delete_icon(&self, path: &str) {
+    pub(crate) fn delete_icon(&self, path: &str) {
         let dlg = gtk::MessageDialog::new(
             Some(&self.win),
             gtk::DialogFlags::MODAL,
@@ -1223,7 +904,7 @@ impl DesktopWindow {
         }
     }
 
-    fn icon_properties(&self, path: &str) {
+    pub(crate) fn icon_properties(&self, path: &str) {
         let p = Path::new(path);
         let meta = p.metadata();
         let (kind, size, modified) = match &meta {
@@ -1362,7 +1043,7 @@ impl DesktopWindow {
                         bv.borrow().content.child_set_property(
                             ic.widget.clone(),
                             "width-request",
-                            &(icons_util::icon_total(size) + 4),
+                            &(layout::icon_total(size) + 4),
                         );
                     } else {
                         self.add_icon(&ic, x, y);
@@ -1397,7 +1078,7 @@ impl DesktopWindow {
                         let (x, y) = ic.position(&self.fixed);
                         self.add_icon(&ic, x, y);
                     }
-                } else if let Some(par) = ic.widget.parent() {
+                } else if ic.widget.parent().is_some() {
                     self.fixed.remove(&ic.widget.clone());
                 }
             }
@@ -1419,7 +1100,7 @@ impl DesktopWindow {
             let b = b.borrow();
             let (bx, by) = b.pos;
             let (bw, bh) = b.size();
-            if px >= bx && px <= bx + bw && py >= by && py <= by + bh {
+            if layout::point_in_rect(px, py, bx, by, bw, bh) {
                 return;
             }
         }
@@ -1428,6 +1109,7 @@ impl DesktopWindow {
         }
     }
 
+    /// 从当前控件状态重建 Config 并原子保存
     pub fn persist(&self) {
         let cfg = self.cfg.clone();
         let icons = self.icons.clone();
@@ -1471,7 +1153,7 @@ impl DesktopWindow {
             });
         }
         drop(c);
-        crate::model::save_config(&cfg.borrow());
+        self.store.save(&cfg.borrow());
     }
 
     pub fn rename_box(&self, bv: &Rc<RefCell<BoxView>>) {

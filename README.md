@@ -158,21 +158,47 @@ gnome-extensions disable desktop-icons@csoriano
 
 ## 项目结构
 
+项目按**功能模块分层**组织，依赖关系单向：`window → ui / infra / core`、`infra → core`、`core` 不依赖任何平台/GTK API。
+
 ```
 src/
-├── main.rs         # 入口：单实例检查、GTK 初始化
-├── model.rs        # 配置模型与持久化（JSON）
-├── window.rs       # 桌面层窗口：图标/盒子/拖拽/动画/菜单/整理
-├── icon.rs         # 桌面图标控件（图标+文字，选中/拖拽）
-├── icons_util.rs   # 图标渲染：系统主题图标提取、圆角背景
-├── categorize.rs   # 分类规则引擎
-├── launch.rs       # 打开/删除/显示位置（xdg-open/gio）
-├── settings.rs     # 设置面板
-└── theme.rs        # 浅色/深色主题调色板
+├── lib.rs            # 库入口：暴露 core / infra / ui / window 四层
+├── main.rs           # 二进制入口：单实例检查、GTK 初始化
+├── core/             # 核心领域层（纯数据/纯算法，零 GTK 依赖，可独立单测）
+│   ├── config.rs         # 配置数据模型（Theme/BoxStyle 类型化枚举，字段级默认值）
+│   ├── config_store.rs   # 配置持久化（可注入目录、原子写入、损坏兜底）
+│   ├── categorize.rs     # 图标分类规则（纯函数 + 文件系统入口）
+│   ├── layout.rs         # 网格/吸附/盒子尺寸等纯几何计算
+│   └── organize.rs       # 一键整理分组排序与布局规划（纯算法）
+├── infra/            # 平台能力层
+│   ├── single_instance.rs  # PID 单实例
+│   ├── autostart.rs        # 开机自启
+│   └── launch.rs           # xdg-open / 文件管理器 / 删除（gio）
+├── ui/               # GTK 控件层
+│   ├── theme.rs           # 浅色/深色调色板
+│   ├── icon_surface.rs    # 图标渲染（cairo + 系统图标主题）
+│   ├── desktop_icon.rs    # 桌面图标控件（图标+文字，选中/拖拽）
+│   ├── box_view.rs        # 整理盒控件
+│   ├── menu.rs            # 桌面/图标/盒子右键菜单
+│   └── settings.rs        # 设置面板
+└── window.rs         # 应用编排层：窗口生命周期 + 事件分发 + 把方案应用到控件
+tests/                # 集成测试（整理链路端到端 / 配置持久化全流程）
 packaging/
 ├── kylin-desktop-organizer.desktop   # 应用菜单/自启启动器
 └── install.sh                        # 一键安装脚本
 ```
+
+## 测试与质量保障
+
+核心算法（分类规则、网格布局、吸附、整理规划）与配置持久化全部隔离在 `core` 层，不依赖 GTK，可在无图形环境下测试；`tests/` 集成测试覆盖「扫描 → 分类 → 分组 → 布局规划」完整链路与配置保存/迁移/兜底的生命周期。
+
+运行测试（需要 GTK3 开发库）：
+
+```bash
+cargo test
+```
+
+CI（`.github/workflows/test.yml`）在 `ubuntu:20.04` 容器（与麒麟 V10 运行时一致）中自动执行格式检查、全量单元/集成测试与 release 编译，保证每次提交的改动可重复验证。
 
 ## 常见问题
 

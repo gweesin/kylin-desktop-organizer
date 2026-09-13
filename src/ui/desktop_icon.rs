@@ -1,12 +1,14 @@
 //! 桌面图标控件：GTK 容器（图标 surface + 文字标签），支持拖拽 / 选中 / 双击
+//! （原 `icon.rs` 迁移）
 
-use crate::icons_util;
+use crate::core::layout::icon_total;
+use crate::ui::icon_surface;
 use gtk::prelude::*;
 use gtk::{gdk, Fixed, Label};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IconKind {
     Desktop,
     Box,
@@ -27,7 +29,7 @@ impl DesktopIcon {
         let eb = gtk::EventBox::new();
         eb.set_above_child(false);
 
-        let total = icons_util::icon_total(icon_size);
+        let total = icon_total(icon_size);
 
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let da = gtk::DrawingArea::new();
@@ -39,7 +41,7 @@ impl DesktopIcon {
         label.set_justify(gtk::Justification::Center);
         label.set_selectable(false);
 
-        let surface = Rc::new(RefCell::new(icons_util::build_icon_surface(
+        let surface = Rc::new(RefCell::new(icon_surface::build_icon_surface(
             &path, icon_size, is_dir,
         )));
 
@@ -143,4 +145,17 @@ pub fn short_name(path: &str) -> String {
 pub fn apply_label_theme(label: &Label) {
     // 默认浅色环境使用深色文字；深色主题由 theme.rs 统一调整
     let _ = label;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_name_strips_desktop_suffix() {
+        assert_eq!(short_name("/home/u/Desktop/firefox.desktop"), "firefox");
+        assert_eq!(short_name("/home/u/Desktop/notes.txt"), "notes.txt");
+        assert_eq!(short_name("/a/b"), "b");
+        assert_eq!(short_name(""), "");
+    }
 }

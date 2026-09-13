@@ -1,14 +1,11 @@
 //! 图标图像工具：统一创建「带圆角背景 + 系统图标的 48/64px」图标表面
+//! （原 `icons_util.rs` 迁移；纯尺寸计算 `icon_total` 已移到 `core::layout`）
 
+use crate::core::layout::icon_total;
 use cairo::{Context, Format, ImageSurface};
 use gdk_pixbuf::{Pixbuf, PixbufExt};
 use gtk::{gdk, prelude::*};
 use std::path::Path;
-
-/// 图标的最终绘制尺寸（图标大小 + 内边距）
-pub fn icon_total(icon_size: i32) -> i32 {
-    icon_size + 16
-}
 
 /// 系统图标主题中查找图标
 fn find_icon_path(names: &[&str]) -> Option<std::path::PathBuf> {
